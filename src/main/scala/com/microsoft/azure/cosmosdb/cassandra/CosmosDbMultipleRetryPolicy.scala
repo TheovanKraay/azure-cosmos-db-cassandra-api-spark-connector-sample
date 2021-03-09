@@ -7,6 +7,7 @@ import com.datastax.oss.driver.api.core.retry.{RetryDecision, RetryPolicy}
 import com.datastax.oss.driver.api.core.servererrors.{CoordinatorException, WriteType}
 import com.datastax.oss.driver.api.core.session.Request
 import com.datastax.spark.connector.cql.MultipleRetryPolicy
+import com.datastax.oss.driver.api.core.servererrors.OverloadedException
 
 
 class CosmosDbMultipleRetryPolicy(context: DriverContext, profileName: String)
@@ -37,39 +38,11 @@ class CosmosDbMultipleRetryPolicy(context: DriverContext, profileName: String)
       }
   }
 
-  override def onReadTimeout(
+  def onErrorResponse(
     request: Request,
-    cl: ConsistencyLevel,
-    blockFor: Int,
-    received: Int,
-    dataPresent: Boolean,
+    error: OverloadedException ,
     retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
-
-  override def onWriteTimeout(
-    request: Request,
-    cl: ConsistencyLevel,
-    writeType: WriteType,
-    blockFor: Int,
-    received: Int,
-    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
-
-  override def onUnavailable(
-    request: Request,
-    cl: ConsistencyLevel,
-    required: Int,
-    alive: Int,
-    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
-
-  override def onRequestAborted(
-    request: Request,
-    error: Throwable,
-    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
-
-  override def onErrorResponse(
-    request: Request,
-    error: CoordinatorException,
-    retryCount: Int): RetryDecision = RetryDecision.RETHROW
-
+    
   override def close(): Unit = {}
 }
 
