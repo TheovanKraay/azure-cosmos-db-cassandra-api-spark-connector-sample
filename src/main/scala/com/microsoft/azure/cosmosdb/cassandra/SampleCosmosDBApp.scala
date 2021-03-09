@@ -10,6 +10,7 @@ import com.datastax.spark.connector._
 import com.datastax.spark.connector.cql.CassandraConnector
 import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkConf, SparkContext}
+import com.microsoft.azure.cosmosdb.cassandra
 
 import scala.util.Random
 
@@ -29,15 +30,21 @@ object SampleCosmosDBApp extends Serializable {
   // MAIN
   def main (arg: Array[String]): Unit = {
 
+    System.out.println("get classpaths...")
+    val cl = ClassLoader.getSystemClassLoader
+    cl.asInstanceOf[java.net.URLClassLoader].getURLs.foreach(println)
+    System.out.println("end get classpaths");
+
     // CONFIG. *NOTE*: Please read the README.md for more details regarding each conf value.
-    val conf = new SparkConf(true)
+    val conf = new SparkConf(true).setMaster("local")
+    //val conf = new SparkConf(true)
       .setAppName("SampleCosmosDBCassandraApp")
       // Cosmos DB Cassandra API Connection configs
-      .set("spark.cassandra.connection.host", "<COSMOSDB_CASSANDRA_ENDPOINT>")
+      .set("spark.cassandra.connection.host", "tvkcassandra.cassandra.cosmos.azure.com")
       .set("spark.cassandra.connection.port", "10350")
       .set("spark.cassandra.connection.ssl.enabled", "true")
-      .set("spark.cassandra.auth.username", "COSMOSDB_ACCOUNTNAME")
-      .set("spark.cassandra.auth.password", "COSMODB_KEY")
+      .set("spark.cassandra.auth.username", "tvkcassandra")
+      .set("spark.cassandra.auth.password", "fOUhRd1tue9DV7oshoDsKiXLamfMHemZ2EjJd9Q8JEjkJEfdPDqyv8HLlPOuxpbIp8XjbAHfrYpJJLubDvCWIQ==")
       // Parallelism and throughput configs.
       .set("spark.cassandra.output.batch.size.rows", "1")
       // *NOTE*: The values below are meant as defaults for a sample workload. Please read the README.md for more information on fine tuning these conf value.
@@ -47,11 +54,13 @@ object SampleCosmosDBApp extends Serializable {
       .set("spark.cassandra.output.batch.grouping.buffer.size", "1000")
       .set("spark.cassandra.connection.keep_alive_ms", "60000")
       // Cosmos DB Connection Factory, configured with retry policy for rate limiting.
-      .set("spark.cassandra.connection.factory", "com.microsoft.azure.cosmosdb.CosmosDbConnectionFactory")
+      .set("spark.cassandra.connection.factory", "com.microsoft.azure.cosmosdb.cassandra.CosmosDbConnectionFactory")
 
 
     // SPARK CONTEXT
-    val sc = new SparkContext(conf)
+    val sc = new SparkContext(conf);
+
+
 
     // CREATE KEYSPACE/TABLE, AND ANY ARBITRARY QUERY STRING.
     CassandraConnector(conf).withSessionDo { session =>

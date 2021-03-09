@@ -1,121 +1,241 @@
-/**
-  * <copyright file="CosmosDbConnectionFactory.scala" company="Microsoft">
-  * Copyright (c) Microsoft. All rights reserved.
-  * </copyright>
- */
 package com.microsoft.azure.cosmosdb.cassandra
 
-import java.nio.file.{Files, Path, Paths}
-import java.security.{KeyStore, SecureRandom}
-import javax.net.ssl.{KeyManagerFactory, SSLContext, TrustManagerFactory}
+import java.io.IOException
+import java.net.{MalformedURLException, URL}
+import java.nio.file.{Files, Paths}
+import java.time.Duration
 
-import com.datastax.driver.core._
-import com.datastax.driver.core.policies.ExponentialReconnectionPolicy
-import com.datastax.spark.connector.cql.CassandraConnectorConf.CassandraSSLConf
+import com.datastax.bdp.spark.ContinuousPagingScanner
+import com.datastax.dse.driver.api.core.DseProtocolVersion
+import com.datastax.dse.driver.api.core.config.DseDriverOption
+import com.datastax.oss.driver.api.core.CqlSession
+import com.datastax.oss.driver.api.core.config.DefaultDriverOption._
+import com.datastax.oss.driver.api.core.config.{DriverConfigLoader, ProgrammaticDriverConfigLoaderBuilder => PDCLB}
+import com.datastax.oss.driver.internal.core.connection.ExponentialReconnectionPolicy
+import com.datastax.oss.driver.internal.core.ssl.DefaultSslEngineFactory
+import com.datastax.spark.connector.rdd.ReadConf
+import com.datastax.spark.connector.util.{ConfigParameter, DeprecatedConfigParameter, ReflectionUtil}
+import org.apache.spark.{SparkConf, SparkEnv, SparkFiles}
+import org.slf4j.LoggerFactory
+
+import scala.collection.JavaConverters._
+import com.datastax.spark.connector.cql.CassandraConnectorConf
+import com.datastax.spark.connector.cql.IpBasedContactInfo
+import com.datastax.spark.connector.cql.LocalNodeFirstLoadBalancingPolicy
+import com.datastax.spark.connector.cql.MultiplexingSchemaListener
+import com.datastax.spark.connector.cql.CloudBasedContactInfo
+import com.datastax.spark.connector.cql.ProfileFileBasedContactInfo
 import com.datastax.spark.connector.cql._
-import org.apache.commons.io.IOUtils
 
+/** Creates both native and Thrift connections to Cassandra.
+  * The connector provides a DefaultConnectionFactory.
+  * Other factories can be plugged in by setting `spark.cassandra.connection.factory` option. */
+trait CosmosDbConnectionFactory extends Serializable {
+
+  /** Creates and configures native Cassandra connection */
+  def createSession(conf: CassandraConnectorConf): CqlSession
+
+  /** List of allowed custom property names passed in SparkConf */
+  def properties: Set[String] = Set.empty
+
+  def getScanner(
+                  readConf: ReadConf,
+                  connConf: CassandraConnectorConf,
+                  columnNames: IndexedSeq[String]): Scanner =
+    new DefaultScanner(readConf, connConf, columnNames)
+
+}
+
+/** Performs no authentication. Use with `AllowAllAuthenticator` in Cassandra. */
 object CosmosDbConnectionFactory extends CassandraConnectionFactory {
+  @transient
+  lazy private val logger = LoggerFactory.getLogger("com.datastax.spark.connector.cql.CassandraConnectionFactory")
 
-  /** Returns the Cluster.Builder object used to setup Cluster instance. */
-  def clusterBuilder(conf: CassandraConnectorConf): Cluster.Builder = {
-    val options = new SocketOptions()
-      .setConnectTimeoutMillis(conf.connectTimeoutMillis)
-      .setReadTimeoutMillis(conf.readTimeoutMillis)
+  def connectorConfigBuilder(conf: CassandraConnectorConf, initBuilder: PDCLB) = {
 
-    val builder = Cluster.builder()
-      .addContactPoints(conf.hosts.toSeq: _*)
-      .withPort(conf.port)
-      /**
-        * Make use of the custom RetryPolicy for Cosmos DB. This Is needed for retrying scenarios specific to Cosmos DB.
-        * Please refer to the "Retry Policy" section of the README.md for more information regarding this.
-        */
-      .withRetryPolicy(
-        new CosmosDbMultipleRetryPolicy(conf.queryRetryCount))
-      .withReconnectionPolicy(
-        new ExponentialReconnectionPolicy(conf.minReconnectionDelayMillis, conf.maxReconnectionDelayMillis))
-      .withLoadBalancingPolicy(
-        new LocalNodeFirstLoadBalancingPolicy(conf.hosts, conf.localDC))
-      .withAuthProvider(conf.authConf.authProvider)
-      .withSocketOptions(options)
-      .withCompression(conf.compression)
-      .withQueryOptions(
-        new QueryOptions()
-          .setRefreshNodeIntervalMillis(0)
-          .setRefreshNodeListIntervalMillis(0)
-          .setRefreshSchemaIntervalMillis(0))
-
-    if (conf.cassandraSSLConf.enabled) {
-      maybeCreateSSLOptions(conf.cassandraSSLConf) match {
-        case Some(sslOptions) ⇒ builder.withSSL(sslOptions)
-        case None ⇒ builder.withSSL()
-      }
-    } else {
+    def basicProperties(builder: PDCLB): PDCLB = {
+      val localCoreThreadCount = Math.max(1, Runtime.getRuntime.availableProcessors() - 1)
       builder
+        .withInt(CONNECTION_POOL_LOCAL_SIZE, conf.localConnectionsPerExecutor.getOrElse(localCoreThreadCount)) // moved from CassandraConnector
+        .withInt(CONNECTION_POOL_REMOTE_SIZE, conf.remoteConnectionsPerExecutor.getOrElse(1)) // moved from CassandraConnector
+        .withInt(CONNECTION_INIT_QUERY_TIMEOUT, conf.connectTimeoutMillis)
+        .withDuration(CONTROL_CONNECTION_TIMEOUT, Duration.ofMillis(conf.connectTimeoutMillis))
+        .withDuration(METADATA_SCHEMA_REQUEST_TIMEOUT, Duration.ofMillis(conf.connectTimeoutMillis))
+        .withInt(REQUEST_TIMEOUT, conf.readTimeoutMillis)
+        .withClass(RETRY_POLICY_CLASS, classOf[CosmosDbMultipleRetryPolicy])
+        .withClass(RECONNECTION_POLICY_CLASS, classOf[ExponentialReconnectionPolicy])
+        .withDuration(RECONNECTION_BASE_DELAY, Duration.ofMillis(conf.minReconnectionDelayMillis))
+        .withDuration(RECONNECTION_MAX_DELAY, Duration.ofMillis(conf.maxReconnectionDelayMillis))
+        .withInt(NETTY_ADMIN_SHUTDOWN_QUIET_PERIOD, conf.quietPeriodBeforeCloseMillis / 1000)
+        .withInt(NETTY_ADMIN_SHUTDOWN_TIMEOUT, conf.timeoutBeforeCloseMillis / 1000)
+        .withInt(NETTY_IO_SHUTDOWN_QUIET_PERIOD, conf.quietPeriodBeforeCloseMillis / 1000)
+        .withInt(NETTY_IO_SHUTDOWN_TIMEOUT, conf.timeoutBeforeCloseMillis / 1000)
+        .withBoolean(NETTY_DAEMON, true)
+        .withBoolean(RESOLVE_CONTACT_POINTS, conf.resolveContactPoints)
+        .withInt(CosmosDbMultipleRetryPolicy.MaxRetryCount, conf.queryRetryCount)
+        .withDuration(DseDriverOption.CONTINUOUS_PAGING_TIMEOUT_FIRST_PAGE, Duration.ofMillis(conf.readTimeoutMillis))
+        .withDuration(DseDriverOption.CONTINUOUS_PAGING_TIMEOUT_OTHER_PAGES, Duration.ofMillis(conf.readTimeoutMillis))
     }
-  }
 
-  private def getKeyStore(
-                           ksType: String,
-                           ksPassword: Option[String],
-                           ksPath: Option[Path]): Option[KeyStore] = {
+    // compression option cannot be set to NONE (default)
+    def compressionProperties(b: PDCLB): PDCLB =
+      Option(conf.compression)
+        .filter(_.toLowerCase != "none")
+        .fold(b)(c => b.withString(PROTOCOL_COMPRESSION, c.toLowerCase))
 
-    ksPath match {
-      case Some(path) =>
-        val ksIn = Files.newInputStream(path)
-        try {
-          val keyStore = KeyStore.getInstance(ksType)
-          keyStore.load(ksIn, ksPassword.map(_.toCharArray).orNull)
-          Some(keyStore)
-        } finally {
-          IOUtils.closeQuietly(ksIn)
-        }
-      case None => None
-    }
-  }
+    def localDCProperty(b: PDCLB): PDCLB =
+      conf.localDC.map(b.withString(LOAD_BALANCING_LOCAL_DATACENTER, _)).getOrElse(b)
 
-  private def maybeCreateSSLOptions(conf: CassandraSSLConf): Option[SSLOptions] = {
-    lazy val trustStore =
-      getKeyStore(conf.trustStoreType, conf.trustStorePassword, conf.trustStorePath.map(Paths.get(_)))
-    lazy val keyStore =
-      getKeyStore(conf.keyStoreType, conf.keyStorePassword, conf.keyStorePath.map(Paths.get(_)))
+    // add ssl properties if ssl is enabled
+    def ipBasedConnectionProperties(ipConf: IpBasedContactInfo) = (builder: PDCLB) => {
+      builder
+        .withStringList(CONTACT_POINTS, ipConf.hosts.map(h => s"${h.getHostString}:${h.getPort}").toList.asJava)
+        .withClass(LOAD_BALANCING_POLICY_CLASS, classOf[LocalNodeFirstLoadBalancingPolicy])
 
-    if (conf.enabled) {
-      val trustManagerFactory = for (ts <- trustStore) yield {
-        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm)
-        tmf.init(ts)
-        tmf
-      }
+      def clientAuthEnabled(value: Option[String]) =
+        if (ipConf.cassandraSSLConf.clientAuthEnabled) value else None
 
-      val keyManagerFactory = if (conf.clientAuthEnabled) {
-        for (ks <- keyStore) yield {
-          val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm)
-          kmf.init(ks, conf.keyStorePassword.map(_.toCharArray).orNull)
-          kmf
-        }
+      if (ipConf.cassandraSSLConf.enabled) {
+        Seq(
+          SSL_TRUSTSTORE_PATH -> ipConf.cassandraSSLConf.trustStorePath,
+          SSL_TRUSTSTORE_PASSWORD -> ipConf.cassandraSSLConf.trustStorePassword,
+          SSL_KEYSTORE_PATH -> clientAuthEnabled(ipConf.cassandraSSLConf.keyStorePath),
+          SSL_KEYSTORE_PASSWORD -> clientAuthEnabled(ipConf.cassandraSSLConf.keyStorePassword))
+          .foldLeft(builder) { case (b, (name, value)) =>
+            value.map(b.withString(name, _)).getOrElse(b)
+          }
+          .withClass(SSL_ENGINE_FACTORY_CLASS, classOf[DefaultSslEngineFactory])
+          .withStringList(SSL_CIPHER_SUITES, ipConf.cassandraSSLConf.enabledAlgorithms.toList.asJava)
+          .withBoolean(SSL_HOSTNAME_VALIDATION, false) // TODO: this needs to be configurable by users. Set to false for our integration tests
       } else {
-        None
+        builder
       }
+    }
 
-      val context = SSLContext.getInstance(conf.protocol)
-      context.init(
-        keyManagerFactory.map(_.getKeyManagers).orNull,
-        trustManagerFactory.map(_.getTrustManagers).orNull,
-        new SecureRandom)
+    val universalProperties: Seq[PDCLB => PDCLB] =
+      Seq( basicProperties, compressionProperties, localDCProperty)
 
-      Some(
-        JdkSSLOptions.builder()
-          .withSSLContext(context)
-          .withCipherSuites(conf.enabledAlgorithms.toArray)
-          .build())
+    val appliedProperties: Seq[PDCLB => PDCLB] = conf.contactInfo match {
+      case ipConf: IpBasedContactInfo => universalProperties :+ ipBasedConnectionProperties(ipConf)
+      case other => universalProperties
+    }
+
+    appliedProperties.foldLeft(initBuilder){ case (builder, properties) => properties(builder)}
+  }
+
+  /** Creates and configures native Cassandra connection */
+  override def createSession(conf: CassandraConnectorConf): CqlSession = {
+    val configLoaderBuilder = DriverConfigLoader.programmaticBuilder()
+    val configLoader = connectorConfigBuilder(conf, configLoaderBuilder).build()
+
+    val initialBuilder = CqlSession.builder()
+
+    val builderWithContactInfo =  conf.contactInfo match {
+      case ipConf: IpBasedContactInfo =>
+        ipConf.authConf.authProvider.fold(initialBuilder)(initialBuilder.withAuthProvider)
+          .withConfigLoader(configLoader)
+      case CloudBasedContactInfo(path, authConf) =>
+        authConf.authProvider.fold(initialBuilder)(initialBuilder.withAuthProvider)
+          .withCloudSecureConnectBundle(maybeGetLocalFile(path))
+          .withConfigLoader(configLoader)
+      case ProfileFileBasedContactInfo(path) =>
+        //Ignore all programmatic config for now ... //todo maybe allow programmatic config here by changing the profile?
+        logger.warn(s"Ignoring all programmatic configuration, only using configuration from $path")
+        initialBuilder.withConfigLoader(DriverConfigLoader.fromUrl(maybeGetLocalFile(path)))
+    }
+
+    val appName = Option(SparkEnv.get).map(env => env.conf.getAppId).getOrElse("NoAppID")
+    builderWithContactInfo
+      .withApplicationName(s"Spark-Cassandra-Connector-$appName")
+      .withSchemaChangeListener(new MultiplexingSchemaListener())
+      .build()
+  }
+
+  /**
+    * Checks the Spark Temp work directory for the file in question, returning
+    * it if exists, returning a generic URL from the string if not
+    */
+  def maybeGetLocalFile(path: String): URL = {
+    val localPath = Paths.get(SparkFiles.get(path))
+    if (Files.exists(localPath)) {
+      logger.info(s"Found the $path locally at $localPath, using this local file.")
+      localPath.toUri.toURL
     } else {
-      None
+      try {
+        new URL(path)
+      } catch {
+        case e: MalformedURLException =>
+          throw new IOException(s"The provided path $path is not a valid URL nor an existing locally path. Provide an " +
+            s"URL accessible to all executors or a path existing on all executors (you may use `spark.files` to " +
+            s"distribute a file to each executor).", e)
+      }
     }
   }
 
-  /** Creates and configures the Cassandra connection */
-  override def createCluster(conf: CassandraConnectorConf): Cluster = {
-    clusterBuilder(conf).build()
+  def continuousPagingEnabled(session: CqlSession): Boolean = {
+    val confEnabled = SparkEnv.get.conf.getBoolean(CassandraConnectionFactory.continuousPagingParam.name, CassandraConnectionFactory.continuousPagingParam.default)
+    val pv = session.getContext.getProtocolVersion
+    if (pv.getCode > DseProtocolVersion.DSE_V1.getCode && confEnabled) {
+      logger.debug(s"Scan Method Being Set to Continuous Paging")
+      true
+    } else {
+      logger.debug(s"Scan Mode Disabled or Connecting to Non-DSE Cassandra Cluster")
+      false
+    }
+  }
+
+  override def getScanner(
+    readConf: ReadConf,
+    connConf: CassandraConnectorConf,
+    columnNames: scala.IndexedSeq[String]): Scanner = {
+
+    val isContinuousPagingEnabled =
+      new CassandraConnector(connConf).withSessionDo { continuousPagingEnabled }
+
+    if (isContinuousPagingEnabled) {
+      logger.debug("Using ContinousPagingScanner")
+      ContinuousPagingScanner(readConf, connConf, columnNames)
+    } else {
+      logger.debug("Not Connected to DSE 5.1 or Greater Falling back to Non-Continuous Paging")
+      new DefaultScanner(readConf, connConf, columnNames)
+    }
+  }
+}
+
+/** Entry point for obtaining `CassandraConnectionFactory` object from [[org.apache.spark.SparkConf SparkConf]],
+  * used when establishing connections to Cassandra. */
+object CassandraConnectionFactory {
+
+  val ReferenceSection = CassandraConnectorConf.ReferenceSection
+  """Name of a Scala module or class implementing
+    |CassandraConnectionFactory providing connections to the Cassandra cluster""".stripMargin
+
+  val FactoryParam = ConfigParameter[CassandraConnectionFactory](
+    name = "spark.cassandra.connection.factory",
+    section = ReferenceSection,
+    default = CosmosDbConnectionFactory,
+    description =
+      """Name of a Scala module or class implementing
+        |CassandraConnectionFactory providing connections to the Cassandra cluster""".stripMargin)
+
+  val continuousPagingParam = ConfigParameter[Boolean] (
+    name = "spark.dse.continuousPagingEnabled",
+    section = "Continuous Paging",
+    default = true,
+    description = "Enables DSE Continuous Paging which improves scanning performance"
+  )
+
+  val deprecatedContinuousPagingParam = DeprecatedConfigParameter (
+    name = "spark.dse.continuous_paging_enabled",
+    replacementParameter = Some(continuousPagingParam),
+    deprecatedSince = "DSE 6.0.0"
+  )
+
+
+  def fromSparkConf(conf: SparkConf): CassandraConnectionFactory = {
+    conf.getOption(FactoryParam.name)
+      .map(ReflectionUtil.findGlobalObject[CassandraConnectionFactory])
+      .getOrElse(FactoryParam.default)
   }
 
 }

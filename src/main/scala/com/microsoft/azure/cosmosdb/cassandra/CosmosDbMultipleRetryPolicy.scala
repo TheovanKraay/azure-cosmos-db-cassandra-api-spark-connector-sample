@@ -1,22 +1,16 @@
-/**
-  * <copyright file="CosmosDbMultipleRetryPolicy.scala" company="Microsoft">
-  * Copyright (c) Microsoft. All rights reserved.
-  * </copyright>
-  */
-
 package com.microsoft.azure.cosmosdb.cassandra
 
-import com.datastax.driver.core.exceptions._
-import com.datastax.driver.core.policies.RetryPolicy.RetryDecision
-import com.datastax.driver.core.{ConsistencyLevel, Statement}
+import com.datastax.oss.driver.api.core.ConsistencyLevel
+import com.datastax.oss.driver.api.core.config.DriverOption
+import com.datastax.oss.driver.api.core.context.DriverContext
+import com.datastax.oss.driver.api.core.retry.{RetryDecision, RetryPolicy}
+import com.datastax.oss.driver.api.core.servererrors.{CoordinatorException, WriteType}
+import com.datastax.oss.driver.api.core.session.Request
 import com.datastax.spark.connector.cql.MultipleRetryPolicy
 
 
-/**
-  * This retry policy extends the MultipleRetryPolicy, and additionally performs retries with back-offs for overloaded exceptions. For more details regarding this, please refer to the "Retry Policy" section of README.md
-  */
-class CosmosDbMultipleRetryPolicy(maxRetryCount: Int)
-  extends MultipleRetryPolicy(maxRetryCount){
+class CosmosDbMultipleRetryPolicy(context: DriverContext, profileName: String)
+  extends MultipleRetryPolicy(context: DriverContext, profileName: String) {
 
   /**
     * The retry policy performs growing/fixed back-offs for overloaded exceptions based on the max retries:
@@ -27,31 +21,62 @@ class CosmosDbMultipleRetryPolicy(maxRetryCount: Int)
   val GrowingBackOffTimeMs: Int = 1000
   val FixedBackOffTimeMs: Int = 5000
 
-  // scalastyle:off null
-  private def retryManyTimesWithBackOffOrThrow(nbRetry: Int): RetryDecision = maxRetryCount match {
-    case -1 =>
+  private val maxRetryCount = context.getConfig.getProfile(profileName).getInt(
+    CosmosDbMultipleRetryPolicy.MaxRetryCount, CosmosDbMultipleRetryPolicy.MaxRetryCountDefault)
+
+  private def retryManyTimesOrThrow(nbRetry: Int): RetryDecision = maxRetryCount match {
+    case -1 => 
       Thread.sleep(FixedBackOffTimeMs)
-      RetryDecision.retry(null)
+      RetryDecision.IGNORE
     case maxRetries =>
       if (nbRetry < maxRetries) {
         Thread.sleep(GrowingBackOffTimeMs * nbRetry)
-        RetryDecision.retry(null)
+        RetryDecision.IGNORE
       } else {
-        RetryDecision.rethrow()
+        RetryDecision.RETHROW
       }
   }
 
-  override def init(cluster: com.datastax.driver.core.Cluster): Unit = {}
-  override def close(): Unit = {}
+  override def onReadTimeout(
+    request: Request,
+    cl: ConsistencyLevel,
+    blockFor: Int,
+    received: Int,
+    dataPresent: Boolean,
+    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
 
-  override def onRequestError(
-                               stmt: Statement,
-                               cl: ConsistencyLevel,
-                               ex: DriverException,
-                               nbRetry: Int): RetryDecision = {
-    ex match {
-      case _: OverloadedException => retryManyTimesWithBackOffOrThrow(nbRetry)
-      case _ => RetryDecision.rethrow()
-    }
+  override def onWriteTimeout(
+    request: Request,
+    cl: ConsistencyLevel,
+    writeType: WriteType,
+    blockFor: Int,
+    received: Int,
+    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
+
+  override def onUnavailable(
+    request: Request,
+    cl: ConsistencyLevel,
+    required: Int,
+    alive: Int,
+    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
+
+  override def onRequestAborted(
+    request: Request,
+    error: Throwable,
+    retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
+
+  override def onErrorResponse(
+    request: Request,
+    error: CoordinatorException,
+    retryCount: Int): RetryDecision = RetryDecision.RETHROW
+
+  override def close(): Unit = {}
+}
+
+object CosmosDbMultipleRetryPolicy {
+  val MaxRetryCount: DriverOption = new DriverOption {
+    override def getPath: String = "advanced.retry-policy.max-retry-count"
   }
+
+  val MaxRetryCountDefault: Int = 60
 }
