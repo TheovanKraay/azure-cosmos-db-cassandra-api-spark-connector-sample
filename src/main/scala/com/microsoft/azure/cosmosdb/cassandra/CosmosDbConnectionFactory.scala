@@ -1,4 +1,4 @@
-package com.microsoft.azure.cosmosdb.cassandra
+package com.datastax.spark.connector.cql
 
 import java.io.IOException
 import java.net.{MalformedURLException, URL}
@@ -19,18 +19,12 @@ import org.apache.spark.{SparkConf, SparkEnv, SparkFiles}
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
-import com.datastax.spark.connector.cql.CassandraConnectorConf
-import com.datastax.spark.connector.cql.IpBasedContactInfo
-import com.datastax.spark.connector.cql.LocalNodeFirstLoadBalancingPolicy
-import com.datastax.spark.connector.cql.MultiplexingSchemaListener
-import com.datastax.spark.connector.cql.CloudBasedContactInfo
-import com.datastax.spark.connector.cql.ProfileFileBasedContactInfo
-import com.datastax.spark.connector.cql._
+import com.microsoft.azure.cosmosdb.cassandra.CosmosDbMultipleRetryPolicy
 
 /** Creates both native and Thrift connections to Cassandra.
   * The connector provides a DefaultConnectionFactory.
   * Other factories can be plugged in by setting `spark.cassandra.connection.factory` option. */
-trait CosmosDbConnectionFactory extends Serializable {
+trait CassandraConnectionFactory extends Serializable {
 
   /** Creates and configures native Cassandra connection */
   def createSession(conf: CassandraConnectorConf): CqlSession
@@ -47,7 +41,7 @@ trait CosmosDbConnectionFactory extends Serializable {
 }
 
 /** Performs no authentication. Use with `AllowAllAuthenticator` in Cassandra. */
-object CosmosDbConnectionFactory extends CassandraConnectionFactory {
+object DefaultConnectionFactory extends CassandraConnectionFactory {
   @transient
   lazy private val logger = LoggerFactory.getLogger("com.datastax.spark.connector.cql.CassandraConnectionFactory")
 
@@ -213,7 +207,7 @@ object CassandraConnectionFactory {
   val FactoryParam = ConfigParameter[CassandraConnectionFactory](
     name = "spark.cassandra.connection.factory",
     section = ReferenceSection,
-    default = CosmosDbConnectionFactory,
+    default = DefaultConnectionFactory,
     description =
       """Name of a Scala module or class implementing
         |CassandraConnectionFactory providing connections to the Cassandra cluster""".stripMargin)

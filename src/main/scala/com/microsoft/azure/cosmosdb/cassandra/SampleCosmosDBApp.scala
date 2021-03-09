@@ -10,7 +10,7 @@ import com.datastax.spark.connector._
 import com.datastax.spark.connector.cql.CassandraConnector
 import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkConf, SparkContext}
-import com.microsoft.azure.cosmosdb.cassandra
+//import com.microsoft.azure.cosmosdb.cassandra
 
 import scala.util.Random
 
@@ -54,7 +54,7 @@ object SampleCosmosDBApp extends Serializable {
       .set("spark.cassandra.output.batch.grouping.buffer.size", "1000")
       .set("spark.cassandra.connection.keep_alive_ms", "60000")
       // Cosmos DB Connection Factory, configured with retry policy for rate limiting.
-      .set("spark.cassandra.connection.factory", "com.microsoft.azure.cosmosdb.cassandra.CosmosDbConnectionFactory")
+      //.set("spark.cassandra.connection.factory", "com.datastax.spark.connector.cql.CosmosConnectionFactory")
 
 
     // SPARK CONTEXT

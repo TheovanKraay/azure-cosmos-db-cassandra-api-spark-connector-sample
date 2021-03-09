@@ -26,6 +26,7 @@ class CosmosDbMultipleRetryPolicy(context: DriverContext, profileName: String)
     CosmosDbMultipleRetryPolicy.MaxRetryCount, CosmosDbMultipleRetryPolicy.MaxRetryCountDefault)
 
   private def retryManyTimesOrThrow(nbRetry: Int): RetryDecision = maxRetryCount match {
+    
     case -1 => 
       Thread.sleep(FixedBackOffTimeMs)
       RetryDecision.IGNORE
@@ -42,7 +43,7 @@ class CosmosDbMultipleRetryPolicy(context: DriverContext, profileName: String)
     request: Request,
     error: OverloadedException ,
     retryCount: Int): RetryDecision = retryManyTimesOrThrow(retryCount)
-    
+
   override def close(): Unit = {}
 }
 
